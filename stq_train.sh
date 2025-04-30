@@ -11,7 +11,7 @@ output_model=${OUTPUT_DIR}
 
 echo ${WORLD_SIZE}
 
-torchrun --nnodes=${WORLD_SIZE} --nproc_per_node=${TQ_GPU_NUM} ./tsgpt/train/train_mem.py \
+torchrun --nnodes=${WORLD_SIZE} --nproc_per_node=${TQ_GPU_NUM} --master_port=15668 ./tsgpt/train/train_mem.py \
     --model_name_or_path ${model_path} \
     --llm_version mpt \
     --st_version v0 \

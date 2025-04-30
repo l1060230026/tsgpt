@@ -36,7 +36,8 @@ class STQwen2Lightning(LightningModule):
         self.data_args = data_args
         compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
-        bnb_model_from_pretrained_args = {}
+        bnb_model_from_pretrained_args = {'use_flash_attention_2':True,
+        'torch_dtype':torch.bfloat16}
 
         ## load 4 8 bit
         if training_args.bits in [4, 8]:
@@ -60,7 +61,6 @@ class STQwen2Lightning(LightningModule):
         self.model = STQwen2ForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
-            use_flash_attention_2=True
             **bnb_model_from_pretrained_args
         )
 
