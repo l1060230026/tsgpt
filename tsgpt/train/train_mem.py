@@ -11,11 +11,11 @@ sys.path.append(rootPath)
 
 
 # Need to call this before importing transformers.
-from tsgpt.train.llama2_flash_attn_monkey_patch import (
-    replace_llama_attn_with_flash_attn,
+from tsgpt.train.qwen_flash_attn_monkey_patch import (
+    replace_qwen_attn_with_flash_attn,
 )
 
-replace_llama_attn_with_flash_attn()
+replace_qwen_attn_with_flash_attn()
 
 import torch.distributed as dist
 from datetime import timedelta
