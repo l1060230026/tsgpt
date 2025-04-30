@@ -752,7 +752,18 @@ class LazySupervisedDataset_ST(Dataset):
 
         st_data = torch.nan_to_num(data_values, nan=0.0)
 
-        response = raw_data['answer']
+        answer = raw_data['answer']
+        if 'rationales' in raw_data.keys():
+            rationales = raw_data['rationales']
+            response = 'Reasoning:\n'
+            for rationale in rationales:
+                response += f'{rationale}\n'
+            response += f'Answer: {answer}'
+        else:
+            solutions = raw_data['solutions']
+            query += '\n\n' + solutions
+
+            response = f'Answer: {answer}'
 
         sources = [{'from': 'human', 'value': query}, {'from': 'gpt', 'value': response}]
 

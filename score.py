@@ -42,7 +42,7 @@ Evaluation:
 api_keys = ['78a829522304f98d99428126394a2bf4',
             'd857a1c395da16b7e96221323f1dafd5', 
             '08debd5db005aea535b052a4442e1163',
-            'e2f0b576d86dcc538ae101fc02150dc3',
+            # 'e2f0b576d86dcc538ae101fc02150dc3',
             'becd3719f15ec4a8482eefc805559a44',
             '9a2a0faf11f6ae90e8eb165f789bd8b1',
             '92baa264e510d1b89ed7f8adf793a87c',
@@ -109,6 +109,7 @@ def llm_request(text, process_id):
             else:
                 return message_content
         except Exception as e:
+            # print(f"Error: {e}")
             time.sleep(random.randint(1, 5))  #随机休息1-5s
             continue
 
@@ -168,7 +169,7 @@ if __name__ == "__main__":
     # Skip already processed items
     remaining_data = all_data[processed_count:]
 
-    num_processes = 1 * len(api_keys)
+    num_processes = 16 * len(api_keys)
     
     # Use multiprocessing with 16 processes
     with Pool(num_processes) as pool:
