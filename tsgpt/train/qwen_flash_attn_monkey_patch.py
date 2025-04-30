@@ -12,6 +12,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2Model,
     rotate_half,
+    Qwen2RotaryEmbedding,
 )
 
 
@@ -65,6 +66,14 @@ def forward(
     if past_key_value is not None:
         past_kv_len = past_key_value[0].shape[2]
         kv_seq_len += past_kv_len
+
+    # Initialize rotary embedding if not exists
+    if not hasattr(self, 'rotary_emb'):
+        self.rotary_emb = Qwen2RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.config.max_position_embeddings,
+            base=self.config.rope_theta,
+        )
 
     cos_sin = self.rotary_emb(v, seq_len=kv_seq_len)
     q, k = apply_rotary_pos_emb(q, k, cos_sin, position_ids)
