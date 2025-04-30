@@ -1,0 +1,54 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python 调试程序: 当前文件",
+            "type": "debugpy",
+            "request": "launch",
+            //"program": "${file}",
+            "console": "integratedTerminal",
+            "module": "torch.distributed.run",
+            "args": [
+                "--nnodes", "1",
+                "--nproc_per_node", "2",
+                "--master_port", "15668",
+                "tsgpt/train/train_mem.py",
+                "--model_name_or_path", "./checkpoints/Qwen2-0.5B-Instruct",
+                "--llm_version", "mpt",
+                "--st_version", "v0",
+                "--data_path", "./ST_data/transport/",
+                "--lora_enable", "True",
+                "--tune_mlp_adapter", "True",
+                "--freeze_backbone", "True",
+                "--use_st_start_end",
+                "--output_dir", "./checkpoints/my/",
+                "--num_train_epochs", "1",
+                "--per_device_train_batch_size", "2",
+                "--per_device_eval_batch_size", "4",
+                "--gradient_accumulation_steps", "1",
+                "--num_nodes", "1",
+                "--evaluation_strategy", "no",
+                "--save_strategy", "steps",
+                "--save_steps", "4800",
+                "--save_total_limit", "1",
+                "--learning_rate", "2e-4",
+                "--weight_decay", "0.",
+                "--warmup_ratio", "0.03",
+                "--lr_scheduler_type", "cosine",
+                "--logging_steps", "1",
+                "--model_max_length", "4096",
+                "--gradient_checkpointing", "True",
+                "--lazy_preprocess", "True",
+                "--strategy", "deepspeed_stage_2_offload",
+                "--precision", "bf16"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2,3",
+            }
+
+        }
+    ]
+}
