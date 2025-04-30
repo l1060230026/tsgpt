@@ -39,6 +39,7 @@ def forward(
     use_cache: bool = False,
     padding_mask: Optional[torch.Tensor] = None,
     cache_position: Optional[torch.Tensor] = None,
+    position_embeddings: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     if output_attentions:
         warnings.warn(
