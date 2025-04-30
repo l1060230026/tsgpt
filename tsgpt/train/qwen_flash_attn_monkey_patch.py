@@ -47,12 +47,13 @@ def forward(
         )
 
     bsz, q_len, _ = hidden_states.size()
-    kv_heads = getattr(self, "num_key_value_heads", self.num_heads)
+    num_heads = self.config.num_attention_heads
+    kv_heads = getattr(self.config, "num_key_value_heads", num_heads)
 
     q, k, v = (
         op(hidden_states).view(bsz, q_len, nh, self.head_dim)
         for op, nh in (
-            (self.q_proj, self.num_heads),
+            (self.q_proj, num_heads),
             (self.k_proj, kv_heads),
             (self.v_proj, kv_heads),
         )
@@ -99,7 +100,7 @@ def forward(
             softmax_scale=None,
             causal=True,
         )
-        output_unpad = output_unpad.reshape(-1, self.num_heads * self.head_dim)
+        output_unpad = output_unpad.reshape(-1, num_heads * self.head_dim)
         output = pad_input(output_unpad, indices, bsz, q_len)
 
     return self.o_proj(output), None, past_key_value
