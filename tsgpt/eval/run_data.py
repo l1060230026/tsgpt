@@ -12,24 +12,17 @@ from datetime import datetime
 import logging
 from tqdm import tqdm
 import torch.multiprocessing as mp
+
+curPath = os.path.abspath(os.path.dirname(__file__))
+rootPath = os.path.split(os.path.split(curPath)[0])[0]
+print(curPath, rootPath)
+sys.path.append(rootPath)
+
 from tsgpt.conversation import conv_templates, SeparatorStyle
 from tsgpt.utils import disable_torch_init
 from tsgpt.model.STQwen2 import STQwen2ForCausalLM
 from tsgpt.model.utils import KeywordsStoppingCriteria
 from peft import PeftModel, LoraConfig, get_peft_model
-
-# Set up logging
-def setup_logging(output_dir):
-    log_file = os.path.join(output_dir, f'eval_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
-    return logging.getLogger(__name__)
 
 # Initialize tokenizer in main process
 def init_tokenizer(base_model):
@@ -165,7 +158,6 @@ def load_st(idx, instruct_item, st_data_all, patch_len, stride):
     }
 
 def load_model(args, gpu_id, tokenizer):
-    logger = logging.getLogger(__name__)
     try:
         # Set device for this process
         torch.cuda.set_device(gpu_id)
@@ -206,7 +198,7 @@ def load_model(args, gpu_id, tokenizer):
         
         return model
     except Exception as e:
-        logger.error(f"GPU {gpu_id}: Error loading model: {str(e)}")
+        print(f"GPU {gpu_id}: Error loading model: {str(e)}")
         raise
 
 def process_batch(model, tokenizer, batch_data, gpu_id):
@@ -290,14 +282,12 @@ def process_batch(model, tokenizer, batch_data, gpu_id):
     return results
 
 def process_worker(rank, world_size, args, all_data, tokenizer):
-    logger = logging.getLogger(__name__)
     try:
         # Set device for this process
         torch.cuda.set_device(rank)
         
         # Load model
         model = load_model(args, rank, tokenizer)
-        logger.info(f"GPU {rank}: Model loaded successfully")
         
         # Calculate data split for this GPU
         per_gpu_data = len(all_data) // world_size
@@ -307,7 +297,7 @@ def process_worker(rank, world_size, args, all_data, tokenizer):
         
         # Process data in batches
         all_results = []
-        for i in range(0, len(gpu_data), args.batch_size):
+        for i in tqdm(range(0, len(gpu_data), args.batch_size), desc=f'{rank}'):
             batch = gpu_data[i:i + args.batch_size]
             results = process_batch(model, tokenizer, batch, rank)
             all_results.extend(results)
@@ -322,31 +312,28 @@ def process_worker(rank, world_size, args, all_data, tokenizer):
             json.dump(all_results, f, indent=4)
             
     except Exception as e:
-        logger.error(f"GPU {rank}: Error in worker: {str(e)}")
-    finally:
-        torch.cuda.empty_cache()
+        print(f"GPU {rank}: Error in worker: {str(e)}")
+    # finally:
+    #     torch.cuda.empty_cache()
 
 def run_eval(args):
-    logger = setup_logging(args.output_res_path)
-    logger.info("Starting evaluation")
+    os.makedirs(args.output_res_path, exist_ok=True)
     
     try:
-        os.makedirs(args.output_res_path, exist_ok=True)
         
         # Initialize tokenizer in main process
-        logger.info("Initializing tokenizer...")
         tokenizer = init_tokenizer(args.base_model)
         
         # Load data
         with open(args.prompting_file + args.data_tag + '.jsonl', 'r') as file:
-            prompt_file = [json.loads(line) for line in file][-100:]
+            prompt_file = [json.loads(line) for line in file]
         
         with open(args.st_data_path + 'df.pkl', 'rb') as file:
             st_data_all = pickle.load(file)
         
         # Prepare data
         all_data = []
-        for idx, instruct_item in enumerate(prompt_file):
+        for idx, instruct_item in tqdm(enumerate(prompt_file) total=len(prompt_file), desc='loading data'):
             st_dict = load_st(idx, instruct_item, st_data_all, args.patch_len, args.stride)
             all_data.append((idx, instruct_item, st_dict))
         
@@ -361,23 +348,23 @@ def run_eval(args):
             join=True
         )
         
-        # Combine results from all GPUs
-        all_results = []
-        for gpu_id in range(args.num_gpus):
-            result_file = os.path.join(args.output_res_path, f'results_gpu{gpu_id}.json')
-            if os.path.exists(result_file):
-                with open(result_file, 'r') as f:
-                    gpu_results = json.load(f)
-                    all_results.extend(gpu_results)
+        # # Combine results from all GPUs
+        # all_results = []
+        # for gpu_id in range(args.num_gpus):
+        #     result_file = os.path.join(args.output_res_path, f'results_gpu{gpu_id}.json')
+        #     if os.path.exists(result_file):
+        #         with open(result_file, 'r') as f:
+        #             gpu_results = json.load(f)
+        #             all_results.extend(gpu_results)
         
-        # Save combined results
-        with open(os.path.join(args.output_res_path, 'results.json'), 'w') as f:
-            json.dump(all_results, f, indent=4)
+        # # Save combined results
+        # with open(os.path.join(args.output_res_path, 'results.json'), 'w') as f:
+        #     json.dump(all_results, f, indent=4)
         
-        logger.info("Evaluation completed successfully")
+        print("Evaluation completed successfully")
         
     except Exception as e:
-        logger.error(f"Error in main process: {str(e)}")
+        print(f"Error in main process: {str(e)}")
         raise
     finally:
         torch.cuda.empty_cache()
