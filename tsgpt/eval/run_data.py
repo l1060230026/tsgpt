@@ -223,11 +223,13 @@ def load_prompting_file(file_path, data_tag):
 def load_model(args, gpu_id):
     logger = logging.getLogger(__name__)
     try:
-        logger.info(f"Loading model on GPU {gpu_id}")
+        logger.info(f"GPU {gpu_id}: Starting model loading...")
         disable_torch_init()
+        logger.info(f"GPU {gpu_id}: Loading tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(args.base_model, padding_side='left')
         
         # Load model on CPU first
+        logger.info(f"GPU {gpu_id}: Loading base model...")
         model = STQwen2ForCausalLM.from_pretrained(
             args.base_model, 
             torch_dtype=torch.bfloat16, 
@@ -236,21 +238,25 @@ def load_model(args, gpu_id):
             device_map=None,
         )
         
+        logger.info(f"GPU {gpu_id}: Initializing ST tower...")
         model.get_model().initialize_st_tower(
             args.patch_len, model.config.hidden_size
         )
         
+        logger.info(f"GPU {gpu_id}: Initializing ST tokenizer...")
         model.initialize_st_tokenizer(use_st_start_end=True, tokenizer=tokenizer, 
                                     device=torch.device('cpu'))
         
         adapter_model_path = args.model_name
         adapter_config_path = 'adapter_config.json'
         
+        logger.info(f"GPU {gpu_id}: Loading ST tower weights...")
         st_tower_path = os.path.join(adapter_model_path, 'st_tower.pth')
         st_tower = torch.load(st_tower_path, map_location=torch.device('cpu'))
         model.get_model().st_tower.load_state_dict(st_tower)
         
         if args.lora:
+            logger.info(f"GPU {gpu_id}: Loading LoRA adapter...")
             adapter_path = os.path.join(adapter_model_path, 'adapter_model.safetensors')
             with open(os.path.join(adapter_model_path, adapter_config_path), 'r') as f:
                 config_data = json.load(f)
@@ -264,57 +270,65 @@ def load_model(args, gpu_id):
                 model_state_dict[new_name].copy_(param)
         
         # Convert to bfloat16 and move to GPU
+        logger.info(f"GPU {gpu_id}: Moving model to GPU...")
         model = model.to(torch.bfloat16)
         model = model.cuda(gpu_id)
         
         # Ensure model is in eval mode
         model.eval()
-        logger.info(f"Model loaded successfully on GPU {gpu_id}")
+        logger.info(f"GPU {gpu_id}: Model loaded successfully")
         
         return model, tokenizer
     except Exception as e:
-        logger.error(f"Error loading model on GPU {gpu_id}: {str(e)}")
+        logger.error(f"GPU {gpu_id}: Error loading model: {str(e)}")
         logger.error(traceback.format_exc())
         raise
 
 def process_fn(rank, world_size, args, input_queue, stop_event):
     """Main processing function for each GPU worker"""
     logger = logging.getLogger(__name__)
-    logger.info(f"Starting worker process {rank}")
+    logger.info(f"GPU {rank}: Starting worker process")
     
     try:
         # Load model and tokenizer
+        logger.info(f"GPU {rank}: Loading model and tokenizer...")
         model, tokenizer = load_model(args, rank)
+        logger.info(f"GPU {rank}: Model and tokenizer loaded successfully")
         
         # Initialize results list for this GPU
         gpu_results = []
         processed_count = 0
         empty_queue_count = 0  # Counter for consecutive empty queue checks
         
+        logger.info(f"GPU {rank}: Starting main processing loop")
         while not stop_event.is_set():
             try:
                 # Collect batch_size items from queue with timeout
                 batch_data = []
+                logger.info(f"GPU {rank}: Waiting for data from queue...")
                 for _ in range(args.batch_size):
                     try:
                         input_data = input_queue.get(timeout=5)  # 5 second timeout
                         if input_data is None:
-                            logger.info(f"GPU {rank} received None signal, finishing up...")
+                            logger.info(f"GPU {rank}: Received None signal, finishing up...")
                             break
                         batch_data.append(input_data)
+                        logger.info(f"GPU {rank}: Received data item {len(batch_data)}")
                     except:
                         break
                 
                 if not batch_data:
                     empty_queue_count += 1
+                    logger.info(f"GPU {rank}: Empty queue count: {empty_queue_count}")
                     if empty_queue_count >= 3:  # If queue is empty for 3 consecutive times
-                        logger.info(f"GPU {rank} detected empty queue multiple times, checking if should exit...")
+                        logger.info(f"GPU {rank}: Detected empty queue multiple times, checking if should exit...")
                         if input_queue.empty() and stop_event.is_set():
-                            logger.info(f"GPU {rank} exiting due to empty queue and stop event")
+                            logger.info(f"GPU {rank}: Exiting due to empty queue and stop event")
                             break
                     continue
                 
                 empty_queue_count = 0  # Reset counter if we got data
+                logger.info(f"GPU {rank}: Processing batch of size {len(batch_data)}")
                 
                 # Process batch
                 batch_st_data = []
@@ -342,6 +356,7 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
                     batch_indices.append(idx)
                     batch_instruct_items.append(instruct_item)
                 
+                logger.info(f"GPU {rank}: Preparing batch for model...")
                 # Reverse sequences before padding
                 reversed_batch_input_ids = [torch.flip(ids, [0]) for ids in batch_input_ids]
                 
@@ -361,6 +376,7 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
                 keywords = [stop_str]
                 stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, batch_input_ids)
                 
+                logger.info(f"GPU {rank}: Generating outputs...")
                 with torch.inference_mode():
                     output_ids = model.generate(
                         batch_input_ids,
@@ -372,6 +388,7 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
                         max_new_tokens=1024,
                         stopping_criteria=[stopping_criteria])
                 
+                logger.info(f"GPU {rank}: Processing generated outputs...")
                 # Process each output
                 for i, (idx, instruct_item) in enumerate(zip(batch_indices, batch_instruct_items)):
                     input_token_len = batch_input_ids[i].shape[0]
@@ -409,28 +426,28 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
                     processed_count += 1
                     
                     if processed_count % 10 == 0:
-                        logger.info(f"GPU {rank} processed {processed_count} samples")
+                        logger.info(f"GPU {rank}: Processed {processed_count} samples")
                         with open(os.path.join(args.output_res_path, f'results_{rank}.json'), 'w') as f:
                             json.dump(gpu_results, f, indent=4)
                 
             except Exception as e:
-                logger.error(f"Error in worker process {rank}: {str(e)}")
+                logger.error(f"GPU {rank}: Error in processing loop: {str(e)}")
                 logger.error(traceback.format_exc())
                 continue
         
         # Save final results for this GPU
-        logger.info(f"GPU {rank} finished processing {processed_count} samples")
+        logger.info(f"GPU {rank}: Finished processing {processed_count} samples")
         with open(os.path.join(args.output_res_path, f'results_{rank}.json'), 'w') as f:
             json.dump(gpu_results, f, indent=4)
             
     except Exception as e:
-        logger.error(f"Fatal error in worker process {rank}: {str(e)}")
+        logger.error(f"GPU {rank}: Fatal error: {str(e)}")
         logger.error(traceback.format_exc())
         raise
     finally:
         # Clean up CUDA memory
         torch.cuda.empty_cache()
-        logger.info(f"GPU {rank} process cleaned up and exiting")
+        logger.info(f"GPU {rank}: Process cleaned up and exiting")
 
 def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue, stop_event):
     logger = logging.getLogger(__name__)
@@ -438,14 +455,17 @@ def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue
     
     try:
         total_samples = len(prompt_file)
+        logger.info(f"Total samples to process: {total_samples}")
         with tqdm(total=total_samples, desc="Loading data") as pbar:
             for idx, instruct_item in enumerate(prompt_file):
                 if stop_event.is_set():
                     logger.info("Data loader received stop signal")
                     break
                 try:
+                    logger.info(f"Processing sample {idx}")
                     st_dict = load_st(instruct_item['df_id'], instruct_item, st_data_all, patch_len, stride)
                     input_queue.put((idx, instruct_item, st_dict))
+                    logger.info(f"Put sample {idx} in queue")
                     pbar.update(1)
                 except Exception as e:
                     logger.error(f"Error processing sample {idx}: {str(e)}")
@@ -458,6 +478,7 @@ def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue
         logger.info("Data loader finished, sending None signal to all workers")
         for _ in range(args.num_gpus):  # Send None signal to each worker
             input_queue.put(None)
+            logger.info("Sent None signal to a worker")
         logger.info("Data loader process finished")
 
 def run_eval(args):
