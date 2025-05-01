@@ -159,6 +159,9 @@ def load_st(idx, instruct_item, st_data_all, patch_len, stride):
 def load_model(args, gpu_id):
     logger = logging.getLogger(__name__)
     try:
+        # Set device for this process
+        torch.cuda.set_device(gpu_id)
+        
         disable_torch_init()
         tokenizer = AutoTokenizer.from_pretrained(args.base_model, padding_side='left')
         
@@ -279,22 +282,40 @@ def process_batch(model, tokenizer, batch_data, gpu_id):
     
     return results
 
-def worker(gpu_id, args, data_queue, result_queue):
+def process_worker(rank, world_size, args, all_data):
     logger = logging.getLogger(__name__)
     try:
-        model, tokenizer = load_model(args, gpu_id)
-        logger.info(f"GPU {gpu_id}: Model loaded successfully")
+        # Set device for this process
+        torch.cuda.set_device(rank)
         
-        while True:
-            batch_data = data_queue.get()
-            if batch_data is None:
-                break
-                
-            results = process_batch(model, tokenizer, batch_data, gpu_id)
-            result_queue.put(results)
+        # Load model
+        model, tokenizer = load_model(args, rank)
+        logger.info(f"GPU {rank}: Model loaded successfully")
+        
+        # Calculate data split for this GPU
+        per_gpu_data = len(all_data) // world_size
+        start_idx = rank * per_gpu_data
+        end_idx = start_idx + per_gpu_data if rank < world_size - 1 else len(all_data)
+        gpu_data = all_data[start_idx:end_idx]
+        
+        # Process data in batches
+        all_results = []
+        for i in range(0, len(gpu_data), args.batch_size):
+            batch = gpu_data[i:i + args.batch_size]
+            results = process_batch(model, tokenizer, batch, rank)
+            all_results.extend(results)
+            
+            # Save intermediate results
+            if (i + args.batch_size) % (args.batch_size * 10) == 0:
+                with open(os.path.join(args.output_res_path, f'results_gpu{rank}.json'), 'w') as f:
+                    json.dump(all_results, f, indent=4)
+        
+        # Save final results for this GPU
+        with open(os.path.join(args.output_res_path, f'results_gpu{rank}.json'), 'w') as f:
+            json.dump(all_results, f, indent=4)
             
     except Exception as e:
-        logger.error(f"GPU {gpu_id}: Error in worker: {str(e)}")
+        logger.error(f"GPU {rank}: Error in worker: {str(e)}")
     finally:
         torch.cuda.empty_cache()
 
@@ -318,39 +339,29 @@ def run_eval(args):
             st_dict = load_st(idx, instruct_item, st_data_all, args.patch_len, args.stride)
             all_data.append((idx, instruct_item, st_dict))
         
-        # Create queues
-        data_queue = mp.Queue()
-        result_queue = mp.Queue()
+        # Set start method for multiprocessing
+        mp.set_start_method('spawn', force=True)
         
         # Start worker processes
-        processes = []
-        for gpu_id in range(args.num_gpus):
-            p = mp.Process(target=worker, args=(gpu_id, args, data_queue, result_queue))
-            p.start()
-            processes.append(p)
+        mp.spawn(
+            process_worker,
+            args=(args.num_gpus, args, all_data),
+            nprocs=args.num_gpus,
+            join=True
+        )
         
-        # Distribute data
-        for i in range(0, len(all_data), args.batch_size):
-            batch = all_data[i:i + args.batch_size]
-            data_queue.put(batch)
-        
-        # Signal workers to finish
-        for _ in range(args.num_gpus):
-            data_queue.put(None)
-        
-        # Collect results
+        # Combine results from all GPUs
         all_results = []
-        for _ in range(len(all_data) // args.batch_size + (1 if len(all_data) % args.batch_size else 0)):
-            results = result_queue.get()
-            all_results.extend(results)
+        for gpu_id in range(args.num_gpus):
+            result_file = os.path.join(args.output_res_path, f'results_gpu{gpu_id}.json')
+            if os.path.exists(result_file):
+                with open(result_file, 'r') as f:
+                    gpu_results = json.load(f)
+                    all_results.extend(gpu_results)
         
-        # Save results
+        # Save combined results
         with open(os.path.join(args.output_res_path, 'results.json'), 'w') as f:
             json.dump(all_results, f, indent=4)
-        
-        # Clean up
-        for p in processes:
-            p.join()
         
         logger.info("Evaluation completed successfully")
         
