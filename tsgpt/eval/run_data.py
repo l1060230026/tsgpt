@@ -260,7 +260,7 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
             batch_data = []
             for _ in range(batch_size):
                 try:
-                    input_data = input_queue.get(timeout=1)
+                    input_data = input_queue.get()
                     if input_data is None:
                         break
                     batch_data.append(input_data)
@@ -322,7 +322,7 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
                     st_data=batch_st_data,
                     st_mask=batch_st_mask,
                     do_sample=True,
-                    temperature=0.01,
+                    temperature=0.2,
                     max_new_tokens=1024,
                     stopping_criteria=[stopping_criteria])
             
@@ -365,10 +365,10 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
                 
                 output_queue.put(result)
 
-            # Clear GPU memory
-            del batch_input_ids
-            del batch_attention_mask
-            torch.cuda.empty_cache()
+            # # Clear GPU memory
+            # del batch_input_ids
+            # del batch_attention_mask
+            # torch.cuda.empty_cache()
             
         except Exception as e:
             print(f"Error in worker process {gpu_id}: {str(e)}")
@@ -395,7 +395,7 @@ def run_eval(args):
     os.makedirs(args.output_res_path, exist_ok=True)
     
     # Load prompting file
-    prompt_file = load_prompting_file(args.prompting_file, args.data_tag)
+    prompt_file = load_prompting_file(args.prompting_file, args.data_tag)[-100:]
     
     # Load ST data
     with open(args.st_data_path + 'df.pkl', 'rb') as file:
@@ -426,7 +426,7 @@ def run_eval(args):
     pbar = tqdm(total=len(prompt_file), desc="Processing")
     while pbar.n < len(prompt_file):
         try:
-            result = output_queue.get(timeout=60)  # Add timeout to prevent hanging
+            result = output_queue.get(timeout=30)  # Add timeout to prevent hanging
             if result is not None:
                 results.append(result)
                 pbar.update(1)
@@ -452,9 +452,9 @@ if __name__ == "__main__":
     parser.add_argument("--prompting_file", type=str, default="ST_data/transport/")
     parser.add_argument("--st_data_path", type=str, default='ST_data/transport/')
     parser.add_argument("--conv-mode", type=str, default=None)
-    parser.add_argument("--output_res_path", type=str, default='outputs')
+    parser.add_argument("--output_res_path", type=str, default='outputs1')
     parser.add_argument("--num_gpus", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=8)  # Batch size for processing
+    parser.add_argument("--batch_size", type=int, default=64)  # Batch size for processing
     parser.add_argument("--lora", type=bool, default=True)
     parser.add_argument("--patch_len", type=int, default=20)
     parser.add_argument("--stride", type=int, default=10)

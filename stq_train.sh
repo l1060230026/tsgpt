@@ -24,7 +24,7 @@ torchrun --nnodes=${WORLD_SIZE} --nproc_per_node=${TQ_GPU_NUM} --master_port=156
     --num_train_epochs 3 \
     --per_device_train_batch_size ${train_batch_size} \
     --per_device_eval_batch_size ${eval_batch_size} \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 4 \
     --num_nodes=${WORLD_SIZE} \
     --save_strategy "no" \
     --save_total_limit 1 \
