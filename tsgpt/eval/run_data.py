@@ -289,6 +289,7 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
         # Initialize results list for this GPU
         gpu_results = []
         processed_count = 0
+        empty_queue_count = 0  # Counter for consecutive empty queue checks
         
         while not stop_event.is_set():
             try:
@@ -298,14 +299,23 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
                     try:
                         input_data = input_queue.get(timeout=5)  # 5 second timeout
                         if input_data is None:
+                            logger.info(f"GPU {rank} received None signal, finishing up...")
                             break
                         batch_data.append(input_data)
                     except:
                         break
                 
                 if not batch_data:
+                    empty_queue_count += 1
+                    if empty_queue_count >= 3:  # If queue is empty for 3 consecutive times
+                        logger.info(f"GPU {rank} detected empty queue multiple times, checking if should exit...")
+                        if input_queue.empty() and stop_event.is_set():
+                            logger.info(f"GPU {rank} exiting due to empty queue and stop event")
+                            break
                     continue
-                    
+                
+                empty_queue_count = 0  # Reset counter if we got data
+                
                 # Process batch
                 batch_st_data = []
                 batch_st_mask = []
@@ -420,6 +430,7 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
     finally:
         # Clean up CUDA memory
         torch.cuda.empty_cache()
+        logger.info(f"GPU {rank} process cleaned up and exiting")
 
 def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue, stop_event):
     logger = logging.getLogger(__name__)
@@ -430,6 +441,7 @@ def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue
         with tqdm(total=total_samples, desc="Loading data") as pbar:
             for idx, instruct_item in enumerate(prompt_file):
                 if stop_event.is_set():
+                    logger.info("Data loader received stop signal")
                     break
                 try:
                     st_dict = load_st(instruct_item['df_id'], instruct_item, st_data_all, patch_len, stride)
@@ -443,7 +455,9 @@ def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue
         logger.error(traceback.format_exc())
     finally:
         # Signal that all data has been loaded
-        input_queue.put(None)
+        logger.info("Data loader finished, sending None signal to all workers")
+        for _ in range(args.num_gpus):  # Send None signal to each worker
+            input_queue.put(None)
         logger.info("Data loader process finished")
 
 def run_eval(args):
@@ -487,14 +501,23 @@ def run_eval(args):
         
         # Wait for data loader to finish
         logger.info("Waiting for data loader to finish")
-        loader_process.join()
+        loader_process.join(timeout=30)  # Add timeout to prevent hanging
+        
+        if loader_process.is_alive():
+            logger.warning("Data loader process did not finish in time, terminating...")
+            loader_process.terminate()
         
         # Wait for input queue to be empty
+        logger.info("Waiting for input queue to be empty")
         while not input_queue.empty():
             time.sleep(1)
         
         # Set stop event to signal workers to finish
+        logger.info("Setting stop event")
         stop_event.set()
+        
+        # Wait a bit for processes to finish
+        time.sleep(5)
         
         logger.info("All processes completed. Results are saved in", args.output_res_path)
         
@@ -504,9 +527,11 @@ def run_eval(args):
         raise
     finally:
         # Clean up
-        if 'loader_process' in locals():
+        if 'loader_process' in locals() and loader_process.is_alive():
+            logger.info("Terminating loader process")
             loader_process.terminate()
         torch.cuda.empty_cache()
+        logger.info("Cleanup completed")
 
 if __name__ == "__main__": 
     parser = argparse.ArgumentParser()
