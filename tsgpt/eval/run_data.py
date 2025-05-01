@@ -281,7 +281,7 @@ def process_batch(model, tokenizer, batch_data, gpu_id):
     
     return results
 
-def process_worker(rank, world_size, args, all_data, tokenizer):
+def process_worker(rank, world_size, args, tokenizer):
     try:
         # Set device for this process
         torch.cuda.set_device(rank)
@@ -289,18 +289,37 @@ def process_worker(rank, world_size, args, all_data, tokenizer):
         # Load model
         model = load_model(args, rank, tokenizer)
         
+        # Load data for this worker
+        with open(args.prompting_file + args.data_tag + '.jsonl', 'r') as file:
+            prompt_file = [json.loads(line) for line in file]
+        
+        with open(args.st_data_path + 'df.pkl', 'rb') as file:
+            st_data_all = pickle.load(file)
+        
         # Calculate data split for this GPU
-        per_gpu_data = len(all_data) // world_size
+        per_gpu_data = len(prompt_file) // world_size
         start_idx = rank * per_gpu_data
-        end_idx = start_idx + per_gpu_data if rank < world_size - 1 else len(all_data)
-        gpu_data = all_data[start_idx:end_idx]
+        end_idx = start_idx + per_gpu_data if rank < world_size - 1 else len(prompt_file)
         
         # Process data in batches
         all_results = []
-        for i in tqdm(range(0, len(gpu_data), args.batch_size), desc=f'{rank}'):
-            batch = gpu_data[i:i + args.batch_size]
-            results = process_batch(model, tokenizer, batch, rank)
+        for i in tqdm(range(start_idx, end_idx, args.batch_size), desc=f'Worker {rank} processing'):
+            batch_end = min(i + args.batch_size, end_idx)
+            batch_data = []
+            
+            # Load only the current batch of data
+            for idx in range(i, batch_end):
+                instruct_item = prompt_file[idx]
+                st_dict = load_st(idx, instruct_item, st_data_all, args.patch_len, args.stride)
+                batch_data.append((idx, instruct_item, st_dict))
+            
+            # Process the current batch
+            results = process_batch(model, tokenizer, batch_data, rank)
             all_results.extend(results)
+            
+            # Clear memory after processing each batch
+            del batch_data
+            torch.cuda.empty_cache()
             
             # Save intermediate results
             if (i + args.batch_size) % (args.batch_size * 10) == 0:
@@ -313,29 +332,15 @@ def process_worker(rank, world_size, args, all_data, tokenizer):
             
     except Exception as e:
         print(f"GPU {rank}: Error in worker: {str(e)}")
-    # finally:
-    #     torch.cuda.empty_cache()
+    finally:
+        torch.cuda.empty_cache()
 
 def run_eval(args):
     os.makedirs(args.output_res_path, exist_ok=True)
     
     try:
-        
         # Initialize tokenizer in main process
         tokenizer = init_tokenizer(args.base_model)
-        
-        # Load data
-        with open(args.prompting_file + args.data_tag + '.jsonl', 'r') as file:
-            prompt_file = [json.loads(line) for line in file]
-        
-        with open(args.st_data_path + 'df.pkl', 'rb') as file:
-            st_data_all = pickle.load(file)
-        
-        # Prepare data
-        all_data = []
-        for idx, instruct_item in tqdm(enumerate(prompt_file), total=len(prompt_file), desc='loading data'):
-            st_dict = load_st(idx, instruct_item, st_data_all, args.patch_len, args.stride)
-            all_data.append((idx, instruct_item, st_dict))
         
         # Set start method for multiprocessing
         mp.set_start_method('spawn', force=True)
@@ -343,23 +348,10 @@ def run_eval(args):
         # Start worker processes
         mp.spawn(
             process_worker,
-            args=(args.num_gpus, args, all_data, tokenizer),
+            args=(args.num_gpus, args, tokenizer),
             nprocs=args.num_gpus,
             join=True
         )
-        
-        # # Combine results from all GPUs
-        # all_results = []
-        # for gpu_id in range(args.num_gpus):
-        #     result_file = os.path.join(args.output_res_path, f'results_gpu{gpu_id}.json')
-        #     if os.path.exists(result_file):
-        #         with open(result_file, 'r') as f:
-        #             gpu_results = json.load(f)
-        #             all_results.extend(gpu_results)
-        
-        # # Save combined results
-        # with open(os.path.join(args.output_res_path, 'results.json'), 'w') as f:
-        #     json.dump(all_results, f, indent=4)
         
         print("Evaluation completed successfully")
         
