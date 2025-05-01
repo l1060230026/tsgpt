@@ -259,9 +259,9 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
     # Load model and tokenizer
     model, tokenizer = load_model(args, rank)
     
-    # Create output directory for this GPU
-    gpu_output_dir = os.path.join(args.output_res_path, f'gpu_{rank}')
-    os.makedirs(gpu_output_dir, exist_ok=True)
+    # # Create output directory for this GPU
+    # gpu_output_dir = os.path.join(args.output_res_path, f'gpu_{rank}')
+    # os.makedirs(gpu_output_dir, exist_ok=True)
     
     # Initialize results list for this GPU
     gpu_results = []
@@ -374,7 +374,7 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
                 gpu_results.append(result)
                 
                 if len(gpu_results) % 10 == 0:
-                    with open(os.path.join(gpu_output_dir, 'results.json'), 'w') as f:
+                    with open(os.path.join(args.output_res_path, f'results_{rank}.json'), 'w') as f:
                         json.dump(gpu_results, f, indent=4)
             
         except Exception as e:
@@ -382,7 +382,7 @@ def process_fn(rank, world_size, args, input_queue, stop_event):
             continue
     
     # Save final results for this GPU
-    with open(os.path.join(gpu_output_dir, 'results.json'), 'w') as f:
+    with open(os.path.join(args.output_res_path, f'results_{rank}.json'), 'w') as f:
         json.dump(gpu_results, f, indent=4)
 
 def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue, stop_event):
