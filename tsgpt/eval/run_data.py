@@ -31,6 +31,14 @@ def setup_logging(output_dir):
     )
     return logging.getLogger(__name__)
 
+# Initialize tokenizer in main process
+def init_tokenizer(base_model):
+    return AutoTokenizer.from_pretrained(
+        base_model,
+        padding_side='left',
+        use_fast=False  # Disable fast tokenizer to avoid multiprocessing issues
+    )
+
 # RevIN and padding layers
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True, subtract_last=False):
@@ -156,14 +164,13 @@ def load_st(idx, instruct_item, st_data_all, patch_len, stride):
         'query': query
     }
 
-def load_model(args, gpu_id):
+def load_model(args, gpu_id, tokenizer):
     logger = logging.getLogger(__name__)
     try:
         # Set device for this process
         torch.cuda.set_device(gpu_id)
         
         disable_torch_init()
-        tokenizer = AutoTokenizer.from_pretrained(args.base_model, padding_side='left')
         
         model = STQwen2ForCausalLM.from_pretrained(
             args.base_model, 
@@ -197,7 +204,7 @@ def load_model(args, gpu_id):
         model = model.cuda(gpu_id)
         model.eval()
         
-        return model, tokenizer
+        return model
     except Exception as e:
         logger.error(f"GPU {gpu_id}: Error loading model: {str(e)}")
         raise
@@ -282,14 +289,14 @@ def process_batch(model, tokenizer, batch_data, gpu_id):
     
     return results
 
-def process_worker(rank, world_size, args, all_data):
+def process_worker(rank, world_size, args, all_data, tokenizer):
     logger = logging.getLogger(__name__)
     try:
         # Set device for this process
         torch.cuda.set_device(rank)
         
         # Load model
-        model, tokenizer = load_model(args, rank)
+        model = load_model(args, rank, tokenizer)
         logger.info(f"GPU {rank}: Model loaded successfully")
         
         # Calculate data split for this GPU
@@ -326,6 +333,10 @@ def run_eval(args):
     try:
         os.makedirs(args.output_res_path, exist_ok=True)
         
+        # Initialize tokenizer in main process
+        logger.info("Initializing tokenizer...")
+        tokenizer = init_tokenizer(args.base_model)
+        
         # Load data
         with open(args.prompting_file + args.data_tag + '.jsonl', 'r') as file:
             prompt_file = [json.loads(line) for line in file][-100:]
@@ -345,7 +356,7 @@ def run_eval(args):
         # Start worker processes
         mp.spawn(
             process_worker,
-            args=(args.num_gpus, args, all_data),
+            args=(args.num_gpus, args, all_data, tokenizer),
             nprocs=args.num_gpus,
             join=True
         )
