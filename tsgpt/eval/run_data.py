@@ -254,9 +254,13 @@ def load_model(args, gpu_id):
     
     return model, tokenizer
 
-def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_event, batch_size=4):
+def process_fn(rank, world_size, args, input_queue, stop_event):
+    """Main processing function for each GPU worker"""
+    # Load model and tokenizer
+    model, tokenizer = load_model(args, rank)
+    
     # Create output directory for this GPU
-    gpu_output_dir = os.path.join(args.output_res_path, f'gpu_{gpu_id}')
+    gpu_output_dir = os.path.join(args.output_res_path, f'gpu_{rank}')
     os.makedirs(gpu_output_dir, exist_ok=True)
     
     # Initialize results list for this GPU
@@ -266,7 +270,7 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
         try:
             # Collect batch_size items from queue
             batch_data = []
-            for _ in range(batch_size):
+            for _ in range(args.batch_size):
                 try:
                     input_data = input_queue.get()
                     if input_data is None:
@@ -299,7 +303,7 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
                 
                 batch_st_data.append(st_data)
                 batch_st_mask.append(st_dict["st_mask"])
-                batch_input_ids.append(inputs.input_ids[0])  # Remove batch dimension
+                batch_input_ids.append(inputs.input_ids[0])
                 batch_prompts.append(prompt)
                 batch_indices.append(idx)
                 batch_instruct_items.append(instruct_item)
@@ -310,14 +314,14 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
             batch_input_ids = torch.nn.utils.rnn.pad_sequence(
                 reversed_batch_input_ids,
                 batch_first=True,
-                padding_value=tokenizer.pad_token_id).cuda(device=gpu_id)
+                padding_value=tokenizer.pad_token_id).cuda(device=rank)
             
             # Reverse back after padding
             batch_input_ids = torch.flip(batch_input_ids, [1])
             
-            batch_attention_mask=batch_input_ids.ne(tokenizer.pad_token_id).cuda(device=gpu_id)
-            batch_st_data = [item.to(torch.bfloat16).cuda(device=gpu_id) for item in batch_st_data]
-            batch_st_mask = [item.cuda(device=gpu_id) for item in batch_st_mask]
+            batch_attention_mask = batch_input_ids.ne(tokenizer.pad_token_id).cuda(device=rank)
+            batch_st_data = [item.to(torch.bfloat16).cuda(device=rank) for item in batch_st_data]
+            batch_st_mask = [item.cuda(device=rank) for item in batch_st_mask]
                        
             stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
             keywords = [stop_str]
@@ -337,17 +341,13 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
             # Process each output
             for i, (idx, instruct_item) in enumerate(zip(batch_indices, batch_instruct_items)):
                 input_token_len = batch_input_ids[i].shape[0]
-                # Get the actual output tokens for this sample
                 sample_output_ids = output_ids[i, input_token_len:]
-                # Decode only the generated tokens for this sample
                 outputs = tokenizer.decode(sample_output_ids, skip_special_tokens=False)
                 
-                # Find the position of stop_str and truncate the output
                 if stop_str in outputs:
                     outputs = outputs.split(stop_str)[0]
                 outputs = outputs.strip()
                 
-                # Extract reasoning steps
                 rationales = []
                 if "Reasoning:" in outputs:
                     reasoning_text = outputs.split("Reasoning:")[1].split("Answer:")[0].strip()
@@ -371,16 +371,14 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
                     "groundtruth": instruct_item['answer']
                 }
                 
-                # Add result to GPU's results list
                 gpu_results.append(result)
                 
-                # Save results periodically (every 10 results)
                 if len(gpu_results) % 10 == 0:
                     with open(os.path.join(gpu_output_dir, 'results.json'), 'w') as f:
                         json.dump(gpu_results, f, indent=4)
             
         except Exception as e:
-            print(f"Error in worker process {gpu_id}: {str(e)}")
+            print(f"Error in worker process {rank}: {str(e)}")
             continue
     
     # Save final results for this GPU
@@ -400,10 +398,6 @@ def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue
         # Signal that all data has been loaded
         input_queue.put(None)
 
-def worker_fn(rank, world_size, args, input_queue, output_queue, stop_event):
-    model, tokenizer = load_model(args, rank)
-    worker_process(rank, model, tokenizer, input_queue, output_queue, stop_event, args.batch_size)
-
 def run_eval(args):
     os.makedirs(args.output_res_path, exist_ok=True)
     
@@ -415,7 +409,7 @@ def run_eval(args):
         st_data_all = pickle.load(file)
     
     # Create input queue and stop event
-    input_queue = Queue(maxsize=args.num_gpus * 4)  # Queue size for single process per GPU
+    input_queue = Queue(maxsize=args.num_gpus * 4)
     stop_event = Event()
     
     # Start data loader process
@@ -425,15 +419,13 @@ def run_eval(args):
     )
     loader_process.start()
     
-    # Start worker processes using spawn
-    worker_processes = []
-    for rank in range(args.num_gpus):
-        p = Process(
-            target=worker_fn,
-            args=(rank, args.num_gpus, args, input_queue, None, stop_event)
-        )
-        p.start()
-        worker_processes.append(p)
+    # Use mp.spawn to start worker processes
+    mp.spawn(
+        process_fn,
+        args=(args.num_gpus, args, input_queue, stop_event),
+        nprocs=args.num_gpus,
+        join=True
+    )
     
     # Wait for data loader to finish
     loader_process.join()
@@ -444,10 +436,6 @@ def run_eval(args):
     
     # Set stop event to signal workers to finish
     stop_event.set()
-    
-    # Wait for all worker processes to finish
-    for p in worker_processes:
-        p.join()
     
     print("All processes completed. Results are saved in GPU-specific directories under", args.output_res_path)
 
