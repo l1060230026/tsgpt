@@ -254,6 +254,13 @@ def load_model(args, gpu_id):
     return model, tokenizer
 
 def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_event, batch_size=4):
+    # Create output directory for this GPU
+    gpu_output_dir = os.path.join(args.output_res_path, f'gpu_{gpu_id}')
+    os.makedirs(gpu_output_dir, exist_ok=True)
+    
+    # Initialize results list for this GPU
+    gpu_results = []
+    
     while not stop_event.is_set():
         try:
             # Collect batch_size items from queue
@@ -363,16 +370,21 @@ def worker_process(gpu_id, model, tokenizer, input_queue, output_queue, stop_eve
                     "groundtruth": instruct_item['answer']
                 }
                 
-                output_queue.put(result)
-
-            # # Clear GPU memory
-            # del batch_input_ids
-            # del batch_attention_mask
-            # torch.cuda.empty_cache()
+                # Add result to GPU's results list
+                gpu_results.append(result)
+                
+                # Save results periodically (every 10 results)
+                if len(gpu_results) % 10 == 0:
+                    with open(os.path.join(gpu_output_dir, 'results.json'), 'w') as f:
+                        json.dump(gpu_results, f, indent=4)
             
         except Exception as e:
             print(f"Error in worker process {gpu_id}: {str(e)}")
             continue
+    
+    # Save final results for this GPU
+    with open(os.path.join(gpu_output_dir, 'results.json'), 'w') as f:
+        json.dump(gpu_results, f, indent=4)
 
 def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue, stop_event):
     try:
@@ -401,9 +413,8 @@ def run_eval(args):
     with open(args.st_data_path + 'df.pkl', 'rb') as file:
         st_data_all = pickle.load(file)
     
-    # Create queues for input and output
+    # Create input queue and stop event
     input_queue = Queue(maxsize=args.num_gpus * 4)  # Queue size for single process per GPU
-    output_queue = Queue()
     stop_event = Event()
     
     # Start data loader process
@@ -416,34 +427,18 @@ def run_eval(args):
     # Start worker processes using spawn
     mp.spawn(
         worker_fn,
-        args=(args.num_gpus, args, input_queue, output_queue, stop_event),
+        args=(args.num_gpus, args, input_queue, None, stop_event),  # output_queue is now None
         nprocs=args.num_gpus,
         join=False
     )
     
-    # Collect results with progress bar
-    results = []
-    pbar = tqdm(total=len(prompt_file), desc="Processing")
-    while pbar.n < len(prompt_file):
-        try:
-            result = output_queue.get(timeout=30)  # Add timeout to prevent hanging
-            if result is not None:
-                results.append(result)
-                pbar.update(1)
-                
-        except Exception as e:
-            print(f"Error collecting results: {str(e)}")
-            break
-    
-    pbar.close()
-    
-    # Stop all processes
-    stop_event.set()
+    # Wait for data loader to finish
     loader_process.join()
     
-    # Save final results
-    with open(osp.join(args.output_res_path, 'final_results.json'), "w") as fout:
-        json.dump(results, fout, indent=4)
+    # Set stop event to signal workers to finish
+    stop_event.set()
+    
+    print("All processes completed. Results are saved in GPU-specific directories under", args.output_res_path)
 
 if __name__ == "__main__": 
     parser = argparse.ArgumentParser()
