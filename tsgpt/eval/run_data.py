@@ -12,6 +12,23 @@ from lightning.pytorch.utilities.deepspeed import convert_zero_checkpoint_to_fp3
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process, Queue, Event
 import time
+import logging
+from tqdm import tqdm
+import traceback
+from datetime import datetime
+
+# Set up logging
+def setup_logging(output_dir):
+    log_file = os.path.join(output_dir, f'eval_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
 # Set the start method to 'spawn' for CUDA compatibility
 if __name__ == "__main__":
@@ -204,240 +221,292 @@ def load_prompting_file(file_path, data_tag):
     return data
 
 def load_model(args, gpu_id):
-    # Set CUDA_VISIBLE_DEVICES for this GPU
-    # os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    disable_torch_init()
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, padding_side='left')
-    
-    # Load model on CPU first
-    model = STQwen2ForCausalLM.from_pretrained(
-        args.base_model, 
-        torch_dtype=torch.bfloat16, 
-        use_cache=True,
-        low_cpu_mem_usage=True,
-        device_map=None,  # Disable device_map to prevent expandable_segments
-    )
-    
-    model.get_model().initialize_st_tower(
-        args.patch_len, model.config.hidden_size
-    )
-    
-    model.initialize_st_tokenizer(use_st_start_end=True, tokenizer=tokenizer, 
-                                device=torch.device('cpu'))
-    
-    adapter_model_path = args.model_name
-    adapter_config_path = 'adapter_config.json'
-    
-    st_tower_path = os.path.join(adapter_model_path, 'st_tower.pth')
-    st_tower = torch.load(st_tower_path, map_location=torch.device('cpu'))
-    model.get_model().st_tower.load_state_dict(st_tower)
-    
-    if args.lora:
-        adapter_path = os.path.join(adapter_model_path, 'adapter_model.safetensors')
-        with open(os.path.join(adapter_model_path, adapter_config_path), 'r') as f:
-            config_data = json.load(f)
-        lora_config = LoraConfig(**config_data)
-        model = get_peft_model(model, lora_config)
-        from safetensors.torch import load_file
-        loaded_state_dict = load_file(adapter_path)
-        model_state_dict = model.state_dict()
-        for name, param in loaded_state_dict.items():
-            new_name = name.replace('.weight', '.default.weight')
-            model_state_dict[new_name].copy_(param)
-    
-    # Convert to bfloat16 and move to GPU
-    model = model.to(torch.bfloat16)
-    model = model.cuda(gpu_id)
-    
-    # Ensure model is in eval mode
-    model.eval()
-    
-    return model, tokenizer
+    logger = logging.getLogger(__name__)
+    try:
+        logger.info(f"Loading model on GPU {gpu_id}")
+        disable_torch_init()
+        tokenizer = AutoTokenizer.from_pretrained(args.base_model, padding_side='left')
+        
+        # Load model on CPU first
+        model = STQwen2ForCausalLM.from_pretrained(
+            args.base_model, 
+            torch_dtype=torch.bfloat16, 
+            use_cache=True,
+            low_cpu_mem_usage=True,
+            device_map=None,
+        )
+        
+        model.get_model().initialize_st_tower(
+            args.patch_len, model.config.hidden_size
+        )
+        
+        model.initialize_st_tokenizer(use_st_start_end=True, tokenizer=tokenizer, 
+                                    device=torch.device('cpu'))
+        
+        adapter_model_path = args.model_name
+        adapter_config_path = 'adapter_config.json'
+        
+        st_tower_path = os.path.join(adapter_model_path, 'st_tower.pth')
+        st_tower = torch.load(st_tower_path, map_location=torch.device('cpu'))
+        model.get_model().st_tower.load_state_dict(st_tower)
+        
+        if args.lora:
+            adapter_path = os.path.join(adapter_model_path, 'adapter_model.safetensors')
+            with open(os.path.join(adapter_model_path, adapter_config_path), 'r') as f:
+                config_data = json.load(f)
+            lora_config = LoraConfig(**config_data)
+            model = get_peft_model(model, lora_config)
+            from safetensors.torch import load_file
+            loaded_state_dict = load_file(adapter_path)
+            model_state_dict = model.state_dict()
+            for name, param in loaded_state_dict.items():
+                new_name = name.replace('.weight', '.default.weight')
+                model_state_dict[new_name].copy_(param)
+        
+        # Convert to bfloat16 and move to GPU
+        model = model.to(torch.bfloat16)
+        model = model.cuda(gpu_id)
+        
+        # Ensure model is in eval mode
+        model.eval()
+        logger.info(f"Model loaded successfully on GPU {gpu_id}")
+        
+        return model, tokenizer
+    except Exception as e:
+        logger.error(f"Error loading model on GPU {gpu_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
 
 def process_fn(rank, world_size, args, input_queue, stop_event):
     """Main processing function for each GPU worker"""
-    # Load model and tokenizer
-    model, tokenizer = load_model(args, rank)
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting worker process {rank}")
     
-    # # Create output directory for this GPU
-    # gpu_output_dir = os.path.join(args.output_res_path, f'gpu_{rank}')
-    # os.makedirs(gpu_output_dir, exist_ok=True)
-    
-    # Initialize results list for this GPU
-    gpu_results = []
-    
-    while not stop_event.is_set():
-        try:
-            # Collect batch_size items from queue
-            batch_data = []
-            for _ in range(args.batch_size):
-                try:
-                    input_data = input_queue.get()
-                    if input_data is None:
+    try:
+        # Load model and tokenizer
+        model, tokenizer = load_model(args, rank)
+        
+        # Initialize results list for this GPU
+        gpu_results = []
+        processed_count = 0
+        
+        while not stop_event.is_set():
+            try:
+                # Collect batch_size items from queue with timeout
+                batch_data = []
+                for _ in range(args.batch_size):
+                    try:
+                        input_data = input_queue.get(timeout=5)  # 5 second timeout
+                        if input_data is None:
+                            break
+                        batch_data.append(input_data)
+                    except:
                         break
-                    batch_data.append(input_data)
-                except:
-                    break
-            
-            if not batch_data:
+                
+                if not batch_data:
+                    continue
+                    
+                # Process batch
+                batch_st_data = []
+                batch_st_mask = []
+                batch_input_ids = []
+                batch_prompts = []
+                batch_indices = []
+                batch_instruct_items = []
+                
+                for idx, instruct_item, st_dict in batch_data:
+                    st_data = st_dict['st_data']
+                    qs = st_dict["query"]
+                    
+                    conv_mode = "mpt"
+                    conv = conv_templates[conv_mode].copy()
+                    conv.append_message(conv.roles[0], qs)
+                    conv.append_message(conv.roles[1], None)
+                    prompt = conv.get_prompt()
+                    inputs = tokenizer([prompt], padding=True, return_tensors="pt")
+                    
+                    batch_st_data.append(st_data)
+                    batch_st_mask.append(st_dict["st_mask"])
+                    batch_input_ids.append(inputs.input_ids[0])
+                    batch_prompts.append(prompt)
+                    batch_indices.append(idx)
+                    batch_instruct_items.append(instruct_item)
+                
+                # Reverse sequences before padding
+                reversed_batch_input_ids = [torch.flip(ids, [0]) for ids in batch_input_ids]
+                
+                batch_input_ids = torch.nn.utils.rnn.pad_sequence(
+                    reversed_batch_input_ids,
+                    batch_first=True,
+                    padding_value=tokenizer.pad_token_id).cuda(device=rank)
+                
+                # Reverse back after padding
+                batch_input_ids = torch.flip(batch_input_ids, [1])
+                
+                batch_attention_mask = batch_input_ids.ne(tokenizer.pad_token_id).cuda(device=rank)
+                batch_st_data = [item.to(torch.bfloat16).cuda(device=rank) for item in batch_st_data]
+                batch_st_mask = [item.cuda(device=rank) for item in batch_st_mask]
+                           
+                stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+                keywords = [stop_str]
+                stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, batch_input_ids)
+                
+                with torch.inference_mode():
+                    output_ids = model.generate(
+                        batch_input_ids,
+                        attention_mask=batch_attention_mask,
+                        st_data=batch_st_data,
+                        st_mask=batch_st_mask,
+                        do_sample=True,
+                        temperature=0.2,
+                        max_new_tokens=1024,
+                        stopping_criteria=[stopping_criteria])
+                
+                # Process each output
+                for i, (idx, instruct_item) in enumerate(zip(batch_indices, batch_instruct_items)):
+                    input_token_len = batch_input_ids[i].shape[0]
+                    sample_output_ids = output_ids[i, input_token_len:]
+                    outputs = tokenizer.decode(sample_output_ids, skip_special_tokens=False)
+                    
+                    if stop_str in outputs:
+                        outputs = outputs.split(stop_str)[0]
+                    outputs = outputs.strip()
+                    
+                    rationales = []
+                    if "Reasoning:" in outputs:
+                        reasoning_text = outputs.split("Reasoning:")[1].split("Answer:")[0].strip()
+                        steps = [step.strip() for step in reasoning_text.split("Step") if step.strip()]
+                        rationales = [f"Step{step}" for step in steps]
+                    
+                    parts = outputs.split('Answer:')
+                    if len(parts) > 1:
+                        answer = parts[1].strip()
+                    else:
+                        answer = outputs.strip()
+                    
+                    result = {
+                        "id": idx,
+                        "question": instruct_item['question'],
+                        "role": instruct_item['role'],
+                        "timeseries_operation": instruct_item['timeseries_operation'],
+                        "df_id": instruct_item['df_id'],
+                        "rationales": rationales,
+                        "prediction": answer,
+                        "groundtruth": instruct_item['answer']
+                    }
+                    
+                    gpu_results.append(result)
+                    processed_count += 1
+                    
+                    if processed_count % 10 == 0:
+                        logger.info(f"GPU {rank} processed {processed_count} samples")
+                        with open(os.path.join(args.output_res_path, f'results_{rank}.json'), 'w') as f:
+                            json.dump(gpu_results, f, indent=4)
+                
+            except Exception as e:
+                logger.error(f"Error in worker process {rank}: {str(e)}")
+                logger.error(traceback.format_exc())
                 continue
-                
-            # Process batch
-            batch_st_data = []
-            batch_st_mask = []
-            batch_input_ids = []
-            batch_prompts = []
-            batch_indices = []
-            batch_instruct_items = []
+        
+        # Save final results for this GPU
+        logger.info(f"GPU {rank} finished processing {processed_count} samples")
+        with open(os.path.join(args.output_res_path, f'results_{rank}.json'), 'w') as f:
+            json.dump(gpu_results, f, indent=4)
             
-            for idx, instruct_item, st_dict in batch_data:
-                st_data = st_dict['st_data']
-                qs = st_dict["query"]
-                
-                conv_mode = "mpt"
-                conv = conv_templates[conv_mode].copy()
-                conv.append_message(conv.roles[0], qs)
-                conv.append_message(conv.roles[1], None)
-                prompt = conv.get_prompt()
-                inputs = tokenizer([prompt], padding=True, return_tensors="pt")
-                
-                batch_st_data.append(st_data)
-                batch_st_mask.append(st_dict["st_mask"])
-                batch_input_ids.append(inputs.input_ids[0])
-                batch_prompts.append(prompt)
-                batch_indices.append(idx)
-                batch_instruct_items.append(instruct_item)
-            
-            # Reverse sequences before padding
-            reversed_batch_input_ids = [torch.flip(ids, [0]) for ids in batch_input_ids]
-            
-            batch_input_ids = torch.nn.utils.rnn.pad_sequence(
-                reversed_batch_input_ids,
-                batch_first=True,
-                padding_value=tokenizer.pad_token_id).cuda(device=rank)
-            
-            # Reverse back after padding
-            batch_input_ids = torch.flip(batch_input_ids, [1])
-            
-            batch_attention_mask = batch_input_ids.ne(tokenizer.pad_token_id).cuda(device=rank)
-            batch_st_data = [item.to(torch.bfloat16).cuda(device=rank) for item in batch_st_data]
-            batch_st_mask = [item.cuda(device=rank) for item in batch_st_mask]
-                       
-            stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-            keywords = [stop_str]
-            stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, batch_input_ids)
-            
-            with torch.inference_mode():
-                output_ids = model.generate(
-                    batch_input_ids,
-                    attention_mask=batch_attention_mask,
-                    st_data=batch_st_data,
-                    st_mask=batch_st_mask,
-                    do_sample=True,
-                    temperature=0.2,
-                    max_new_tokens=1024,
-                    stopping_criteria=[stopping_criteria])
-            
-            # Process each output
-            for i, (idx, instruct_item) in enumerate(zip(batch_indices, batch_instruct_items)):
-                input_token_len = batch_input_ids[i].shape[0]
-                sample_output_ids = output_ids[i, input_token_len:]
-                outputs = tokenizer.decode(sample_output_ids, skip_special_tokens=False)
-                
-                if stop_str in outputs:
-                    outputs = outputs.split(stop_str)[0]
-                outputs = outputs.strip()
-                
-                rationales = []
-                if "Reasoning:" in outputs:
-                    reasoning_text = outputs.split("Reasoning:")[1].split("Answer:")[0].strip()
-                    steps = [step.strip() for step in reasoning_text.split("Step") if step.strip()]
-                    rationales = [f"Step{step}" for step in steps]
-                
-                parts = outputs.split('Answer:')
-                if len(parts) > 1:
-                    answer = parts[1].strip()
-                else:
-                    answer = outputs.strip()
-                
-                result = {
-                    "id": idx,
-                    "question": instruct_item['question'],
-                    "role": instruct_item['role'],
-                    "timeseries_operation": instruct_item['timeseries_operation'],
-                    "df_id": instruct_item['df_id'],
-                    "rationales": rationales,
-                    "prediction": answer,
-                    "groundtruth": instruct_item['answer']
-                }
-                
-                gpu_results.append(result)
-                
-                if len(gpu_results) % 10 == 0:
-                    with open(os.path.join(args.output_res_path, f'results_{rank}.json'), 'w') as f:
-                        json.dump(gpu_results, f, indent=4)
-            
-        except Exception as e:
-            print(f"Error in worker process {rank}: {str(e)}")
-            continue
-    
-    # Save final results for this GPU
-    with open(os.path.join(args.output_res_path, f'results_{rank}.json'), 'w') as f:
-        json.dump(gpu_results, f, indent=4)
+    except Exception as e:
+        logger.error(f"Fatal error in worker process {rank}: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+    finally:
+        # Clean up CUDA memory
+        torch.cuda.empty_cache()
 
 def data_loader_process(prompt_file, st_data_all, patch_len, stride, input_queue, stop_event):
+    logger = logging.getLogger(__name__)
+    logger.info("Starting data loader process")
+    
     try:
-        for idx, instruct_item in enumerate(prompt_file):
-            if stop_event.is_set():
-                break
-            st_dict = load_st(instruct_item['df_id'], instruct_item, st_data_all, patch_len, stride)
-            input_queue.put((idx, instruct_item, st_dict))
+        total_samples = len(prompt_file)
+        with tqdm(total=total_samples, desc="Loading data") as pbar:
+            for idx, instruct_item in enumerate(prompt_file):
+                if stop_event.is_set():
+                    break
+                try:
+                    st_dict = load_st(instruct_item['df_id'], instruct_item, st_data_all, patch_len, stride)
+                    input_queue.put((idx, instruct_item, st_dict))
+                    pbar.update(1)
+                except Exception as e:
+                    logger.error(f"Error processing sample {idx}: {str(e)}")
+                    continue
     except Exception as e:
-        print(f"Error in data loader process: {str(e)}")
+        logger.error(f"Error in data loader process: {str(e)}")
+        logger.error(traceback.format_exc())
     finally:
         # Signal that all data has been loaded
         input_queue.put(None)
+        logger.info("Data loader process finished")
 
 def run_eval(args):
-    os.makedirs(args.output_res_path, exist_ok=True)
+    logger = setup_logging(args.output_res_path)
+    logger.info("Starting evaluation")
     
-    # Load prompting file
-    prompt_file = load_prompting_file(args.prompting_file, args.data_tag)[-100:]
-    
-    # Load ST data
-    with open(args.st_data_path + 'df.pkl', 'rb') as file:
-        st_data_all = pickle.load(file)
-    
-    # Create input queue and stop event
-    input_queue = Queue(maxsize=args.num_gpus * 4)
-    stop_event = Event()
-    
-    # Start data loader process
-    loader_process = Process(
-        target=data_loader_process,
-        args=(prompt_file, st_data_all, args.patch_len, args.stride, input_queue, stop_event)
-    )
-    loader_process.start()
-    
-    # Use mp.spawn to start worker processes
-    mp.spawn(
-        process_fn,
-        args=(args.num_gpus, args, input_queue, stop_event),
-        nprocs=args.num_gpus,
-        join=True
-    )
-    
-    # Wait for data loader to finish
-    loader_process.join()
-    
-    # Wait for input queue to be empty
-    while not input_queue.empty():
-        time.sleep(1)
-    
-    # Set stop event to signal workers to finish
-    stop_event.set()
-    
-    print("All processes completed. Results are saved in GPU-specific directories under", args.output_res_path)
+    try:
+        os.makedirs(args.output_res_path, exist_ok=True)
+        
+        # Load prompting file
+        logger.info("Loading prompting file")
+        prompt_file = load_prompting_file(args.prompting_file, args.data_tag)[-100:]
+        logger.info(f"Loaded {len(prompt_file)} samples from prompting file")
+        
+        # Load ST data
+        logger.info("Loading ST data")
+        with open(args.st_data_path + 'df.pkl', 'rb') as file:
+            st_data_all = pickle.load(file)
+        logger.info("ST data loaded successfully")
+        
+        # Create input queue and stop event
+        input_queue = Queue(maxsize=args.num_gpus * 4)
+        stop_event = Event()
+        
+        # Start data loader process
+        logger.info("Starting data loader process")
+        loader_process = Process(
+            target=data_loader_process,
+            args=(prompt_file, st_data_all, args.patch_len, args.stride, input_queue, stop_event)
+        )
+        loader_process.start()
+        
+        # Use mp.spawn to start worker processes
+        logger.info(f"Starting {args.num_gpus} worker processes")
+        mp.spawn(
+            process_fn,
+            args=(args.num_gpus, args, input_queue, stop_event),
+            nprocs=args.num_gpus,
+            join=True
+        )
+        
+        # Wait for data loader to finish
+        logger.info("Waiting for data loader to finish")
+        loader_process.join()
+        
+        # Wait for input queue to be empty
+        while not input_queue.empty():
+            time.sleep(1)
+        
+        # Set stop event to signal workers to finish
+        stop_event.set()
+        
+        logger.info("All processes completed. Results are saved in", args.output_res_path)
+        
+    except Exception as e:
+        logger.error(f"Error in main process: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+    finally:
+        # Clean up
+        if 'loader_process' in locals():
+            loader_process.terminate()
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__": 
     parser = argparse.ArgumentParser()
@@ -448,12 +517,11 @@ if __name__ == "__main__":
     parser.add_argument("--conv-mode", type=str, default=None)
     parser.add_argument("--output_res_path", type=str, default='outputs1')
     parser.add_argument("--num_gpus", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=64)  # Batch size for processing
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lora", type=bool, default=True)
     parser.add_argument("--patch_len", type=int, default=20)
     parser.add_argument("--stride", type=int, default=10)
     parser.add_argument("--data_tag", type=str, default='test')
 
     args = parser.parse_args()
-
     run_eval(args)
