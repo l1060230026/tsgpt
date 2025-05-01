@@ -11,6 +11,7 @@ import re
 from lightning.pytorch.utilities.deepspeed import convert_zero_checkpoint_to_fp32_state_dict
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process, Queue, Event
+import time
 
 # Set the start method to 'spawn' for CUDA compatibility
 if __name__ == "__main__":
@@ -425,18 +426,28 @@ def run_eval(args):
     loader_process.start()
     
     # Start worker processes using spawn
-    mp.spawn(
-        worker_fn,
-        args=(args.num_gpus, args, input_queue, None, stop_event),  # output_queue is now None
-        nprocs=args.num_gpus,
-        join=False
-    )
+    worker_processes = []
+    for rank in range(args.num_gpus):
+        p = Process(
+            target=worker_fn,
+            args=(rank, args.num_gpus, args, input_queue, None, stop_event)
+        )
+        p.start()
+        worker_processes.append(p)
     
     # Wait for data loader to finish
     loader_process.join()
     
+    # Wait for input queue to be empty
+    while not input_queue.empty():
+        time.sleep(1)
+    
     # Set stop event to signal workers to finish
     stop_event.set()
+    
+    # Wait for all worker processes to finish
+    for p in worker_processes:
+        p.join()
     
     print("All processes completed. Results are saved in GPU-specific directories under", args.output_res_path)
 
