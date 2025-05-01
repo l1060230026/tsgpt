@@ -141,7 +141,7 @@ def process_data(data):
         return data
 
 if __name__ == "__main__":
-    outputs_dir = Path("outputs")
+    outputs_dir = Path("outputs1")
     results_file = Path("results.json")
     
     # Get all JSON files in the directory

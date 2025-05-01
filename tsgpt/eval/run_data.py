@@ -333,7 +333,7 @@ def run_eval(args):
         
         # Prepare data
         all_data = []
-        for idx, instruct_item in tqdm(enumerate(prompt_file) total=len(prompt_file), desc='loading data'):
+        for idx, instruct_item in tqdm(enumerate(prompt_file), total=len(prompt_file), desc='loading data'):
             st_dict = load_st(idx, instruct_item, st_data_all, args.patch_len, args.stride)
             all_data.append((idx, instruct_item, st_dict))
         
