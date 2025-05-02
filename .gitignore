@@ -1,3 +1,4 @@
 checkpoints/
 ST_data/
 exp_data/
+*.json

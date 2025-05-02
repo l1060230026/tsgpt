@@ -157,14 +157,17 @@ if __name__ == "__main__":
             all_data.extend(data)
     
     # Load previous results if exists
-    if results_file.exists():
-        with open(results_file, 'r', encoding='utf-8') as f:
-            previous_results = [json.loads(line) for line in f]
-            processed_count = previous_results[-1].get('processed_count', 0) if previous_results else 0
-            score_indices = [item for item in previous_results if 'score' in item]
-    else:
-        processed_count = 0
-        score_indices = []
+    # if results_file.exists():
+    #     with open(results_file, 'r', encoding='utf-8') as f:
+    #         previous_results = [json.loads(line) for line in f]
+    #         processed_count = previous_results[-1].get('processed_count', 0) if previous_results else 0
+    #         score_indices = [item for item in previous_results if 'score' in item]
+    # else:
+    #     processed_count = 0
+    #     score_indices = []
+
+    processed_count = 0
+    score_indices = []
     
     # Skip already processed items
     remaining_data = all_data[processed_count:]
